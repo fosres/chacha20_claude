@@ -73,6 +73,14 @@ static void chacha20_init_state(uint32_t state[CHACHA20_STATE_WORDS],
     state[15] = read_le32(nonce + 8);
 }
 
+/* Secure memory clearing - works even with compiler optimizations */
+static void secure_zero_memory(void *ptr, size_t len) {
+    volatile uint8_t *p = (volatile uint8_t *)ptr;
+    while (len--) {
+        *p++ = 0;
+    }
+}
+
 /* ChaCha20 block function - generates 64 bytes of keystream */
 static void chacha20_block(uint32_t state[CHACHA20_STATE_WORDS],
                           uint8_t output[CHACHA20_BLOCK_SIZE]) {
@@ -106,6 +114,9 @@ static void chacha20_block(uint32_t state[CHACHA20_STATE_WORDS],
     for (i = 0; i < CHACHA20_STATE_WORDS; i++) {
         write_le32(output + (i * 4), working_state[i]);
     }
+
+    /* Clear working state */
+    secure_zero_memory(working_state, sizeof(working_state));
 }
 
 /* ChaCha20 encryption/decryption */
@@ -119,6 +130,11 @@ void chacha20_encrypt(const uint8_t key[CHACHA20_KEY_SIZE],
     uint8_t keystream[CHACHA20_BLOCK_SIZE];
     size_t i, j;
 
+    /* Input validation */
+    if (!key || !nonce || !plaintext || !ciphertext) {
+        return;
+    }
+
     chacha20_init_state(state, key, nonce, counter);
 
     for (i = 0; i < length; i += CHACHA20_BLOCK_SIZE) {
@@ -129,9 +145,16 @@ void chacha20_encrypt(const uint8_t key[CHACHA20_KEY_SIZE],
             ciphertext[i + j] = plaintext[i + j] ^ keystream[j];
         }
 
+        /* Clear keystream from this block */
+        secure_zero_memory(keystream, CHACHA20_BLOCK_SIZE);
+
         /* Increment block counter */
         state[12]++;
     }
+
+    /* Clear sensitive data */
+    secure_zero_memory(state, sizeof(state));
+    secure_zero_memory(keystream, sizeof(keystream));
 }
 
 /* Helper function to print hex */
@@ -167,6 +190,11 @@ int run_test(const test_vector_t *test) {
     uint8_t *ciphertext = malloc(test->length);
     int passed;
 
+    if (!ciphertext) {
+        fprintf(stderr, "Error: Failed to allocate memory for test: %s\n", test->name);
+        return 0;
+    }
+
     printf("\n=== %s ===\n", test->name);
 
     chacha20_encrypt(test->key, test->nonce, test->counter,
@@ -192,7 +220,78 @@ int run_test(const test_vector_t *test) {
     passed = compare_bytes(ciphertext, test->expected, test->length);
     printf("Result:    %s\n", passed ? "PASS " : "FAIL ");
 
+    /* Clear sensitive data before freeing */
+    secure_zero_memory(ciphertext, test->length);
     free(ciphertext);
+    return passed;
+}
+
+/* Test quarter round operation directly */
+int test_quarter_round(void) {
+    uint32_t state[4] = {0x11111111, 0x01020304, 0x9b8d6f43, 0x01234567};
+
+    printf("\n=== RFC 8439 Appendix A.1 - Quarter Round ===\n");
+    printf("Initial state: %08x %08x %08x %08x\n",
+           state[0], state[1], state[2], state[3]);
+
+    QR(state[0], state[1], state[2], state[3]);
+
+    printf("After QR:      %08x %08x %08x %08x\n",
+           state[0], state[1], state[2], state[3]);
+
+    /* Expected values from RFC 8439 */
+    uint32_t expected[4] = {0xea2a92f4, 0xcb1cf8ce, 0x4581472e, 0x5881c4bb};
+
+    int passed = (state[0] == expected[0] && state[1] == expected[1] &&
+                  state[2] == expected[2] && state[3] == expected[3]);
+
+    printf("Expected:      %08x %08x %08x %08x\n",
+           expected[0], expected[1], expected[2], expected[3]);
+    printf("Result:        %s\n", passed ? "PASS ✓" : "FAIL ✗");
+
+    return passed;
+}
+
+/* Test the ChaCha20 block function state */
+int test_block_state(void) {
+    uint32_t state[CHACHA20_STATE_WORDS];
+    uint8_t output[CHACHA20_BLOCK_SIZE];
+
+    printf("\n=== RFC 8439 Appendix A.1 - Block Function State ===\n");
+
+    /* Initialize with test values */
+    uint8_t key[32] = {0};
+    uint8_t nonce[12] = {0};
+    chacha20_init_state(state, key, nonce, 0);
+
+    printf("Initial state (hex words):\n");
+    for (int i = 0; i < 4; i++) {
+        printf("  ");
+        for (int j = 0; j < 4; j++) {
+            printf("%08x ", state[i * 4 + j]);
+        }
+        printf("\n");
+    }
+
+    /* Run the block function */
+    chacha20_block(state, output);
+
+    /* Expected output keystream from RFC 8439 */
+    uint8_t expected[64] = {
+        0x76, 0xb8, 0xe0, 0xad, 0xa0, 0xf1, 0x3d, 0x90,
+        0x40, 0x5d, 0x6a, 0xe5, 0x53, 0x86, 0xbd, 0x28,
+        0xbd, 0xd2, 0x19, 0xb8, 0xa0, 0x8d, 0xed, 0x1a,
+        0xa8, 0x36, 0xef, 0xcc, 0x8b, 0x77, 0x0d, 0xc7,
+        0xda, 0x41, 0x59, 0x7c, 0x51, 0x57, 0x48, 0x8d,
+        0x77, 0x24, 0xe0, 0x3f, 0xb8, 0xd8, 0x4a, 0x37,
+        0x6a, 0x43, 0xb8, 0xf4, 0x15, 0x18, 0xa1, 0x1c,
+        0xc3, 0x87, 0xb6, 0x69, 0xb2, 0xee, 0x65, 0x86
+    };
+
+    int passed = compare_bytes(output, expected, 64);
+
+    printf("Keystream matches expected: %s\n", passed ? "PASS ✓" : "FAIL ✗");
+
     return passed;
 }
 
@@ -201,10 +300,19 @@ int main(void) {
     int passed_tests = 0;
 
     printf("ChaCha20 Implementation Test Suite\n");
-    printf("Based on RFC 8439\n");
+    printf("Based on RFC 8439 (June 2018)\n");
     printf("=====================================\n");
 
-    /* Test Vector 1: RFC 8439 Section 2.4.2 - Example and Test Vector */
+    /* Appendix A.1 Tests - Quarter Round and Block Function */
+    total_tests++;
+    if (test_quarter_round()) passed_tests++;
+
+    total_tests++;
+    if (test_block_state()) passed_tests++;
+
+    printf("\n--- Section 2.4.2: ChaCha20 Encryption ---\n");
+
+    /* Test Vector: RFC 8439 Section 2.4.2 - Sunscreen example */
     {
         static const uint8_t key1[32] = {
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
@@ -238,7 +346,7 @@ int main(void) {
         };
 
         test_vector_t test1 = {
-            .name = "RFC 8439 Section 2.4.2 - Sunscreen",
+            .name = "Section 2.4.2 - Sunscreen Test",
             .key = {0},
             .nonce = {0},
             .counter = 1,
@@ -252,6 +360,8 @@ int main(void) {
         total_tests++;
         if (run_test(&test1)) passed_tests++;
     }
+
+    printf("\n--- Appendix A.2: Test Vectors for ChaCha20 ---\n");
 
     /* Test Vector 2: RFC 8439 Appendix A.2 - All zeros */
     {
@@ -270,7 +380,7 @@ int main(void) {
         };
 
         test_vector_t test2 = {
-            .name = "RFC 8439 Appendix A.2 - All Zeros",
+            .name = "A.2 Test Vector #1 - Keystream (counter=0)",
             .key = {0},
             .nonce = {0},
             .counter = 0,
@@ -285,44 +395,7 @@ int main(void) {
         if (run_test(&test2)) passed_tests++;
     }
 
-    /* Test Vector 3: RFC 8439 Appendix A.1 - Quarter Round Test */
-    /* Testing the block function directly */
-    {
-        uint8_t plaintext3[64] = {0};
-
-        /* All-zero key and nonce to test block function */
-        static const uint8_t key3_mod[32] = {0};
-        static const uint8_t nonce3_mod[12] = {0};
-
-        /* Expected output is the keystream for all-zero key, nonce, counter=0 */
-        static const uint8_t expected3[64] = {
-            0x76, 0xb8, 0xe0, 0xad, 0xa0, 0xf1, 0x3d, 0x90,
-            0x40, 0x5d, 0x6a, 0xe5, 0x53, 0x86, 0xbd, 0x28,
-            0xbd, 0xd2, 0x19, 0xb8, 0xa0, 0x8d, 0xed, 0x1a,
-            0xa8, 0x36, 0xef, 0xcc, 0x8b, 0x77, 0x0d, 0xc7,
-            0xda, 0x41, 0x59, 0x7c, 0x51, 0x57, 0x48, 0x8d,
-            0x77, 0x24, 0xe0, 0x3f, 0xb8, 0xd8, 0x4a, 0x37,
-            0x6a, 0x43, 0xb8, 0xf4, 0x15, 0x18, 0xa1, 0x1c,
-            0xc3, 0x87, 0xb6, 0x69, 0xb2, 0xee, 0x65, 0x86
-        };
-
-        test_vector_t test3 = {
-            .name = "RFC 8439 - Block Function (counter=0)",
-            .key = {0},
-            .nonce = {0},
-            .counter = 0,
-            .plaintext = plaintext3,
-            .expected = expected3,
-            .length = 64
-        };
-        memcpy(test3.key, key3_mod, 32);
-        memcpy(test3.nonce, nonce3_mod, 12);
-
-        total_tests++;
-        if (run_test(&test3)) passed_tests++;
-    }
-
-    /* Test Vector 4: RFC 8439 Appendix A.2 - Block counter=1 */
+    /* Test Vector: Keystream with counter=1 (second block) */
     {
         static const uint8_t key4[32] = {0};
         static const uint8_t nonce4[12] = {0};
@@ -340,7 +413,7 @@ int main(void) {
         };
 
         test_vector_t test4 = {
-            .name = "RFC 8439 Appendix A.2 - Block counter=1",
+            .name = "A.2 Test Vector #1 - Keystream (counter=1)",
             .key = {0},
             .nonce = {0},
             .counter = 1,
@@ -355,7 +428,7 @@ int main(void) {
         if (run_test(&test4)) passed_tests++;
     }
 
-    /* Test Vector 5: Verify this is same as test 1 (duplicate for verification) */
+    /* Test Vector #2: The sunscreen test (same as Section 2.4.2) */
     {
         static const uint8_t key5[32] = {
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
@@ -389,7 +462,7 @@ int main(void) {
         };
 
         test_vector_t test5 = {
-            .name = "Consistency check (same as test 1)",
+            .name = "A.2 Test Vector #2 - Sunscreen (consistency)",
             .key = {0},
             .nonce = {0},
             .counter = 1,
@@ -402,6 +475,47 @@ int main(void) {
 
         total_tests++;
         if (run_test(&test5)) passed_tests++;
+    }
+
+    /* Test Vector #3: Keystream with counter=2 */
+    {
+        static const uint8_t key6[32] = {
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f
+        };
+        static const uint8_t nonce6[12] = {
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4a,
+            0x00, 0x00, 0x00, 0x00
+        };
+        static const uint8_t plaintext6[64] = {0};
+        /* Keystream with counter=2 (third block) */
+        static const uint8_t expected6[64] = {
+            0x69, 0xa6, 0x74, 0x9f, 0x3f, 0x63, 0x0f, 0x41,
+            0x22, 0xca, 0xfe, 0x28, 0xec, 0x4d, 0xc4, 0x7e,
+            0x26, 0xd4, 0x34, 0x6d, 0x70, 0xb9, 0x8c, 0x73,
+            0xf3, 0xe9, 0xc5, 0x3a, 0xc4, 0x0c, 0x59, 0x45,
+            0x39, 0x8b, 0x6e, 0xda, 0x1a, 0x83, 0x2c, 0x89,
+            0xc1, 0x67, 0xea, 0xcd, 0x90, 0x1d, 0x7e, 0x2b,
+            0xf3, 0x63, 0x74, 0x03, 0x73, 0x20, 0x1a, 0xa1,
+            0x88, 0xfb, 0xbc, 0xe8, 0x39, 0x91, 0xc4, 0xed
+        };
+
+        test_vector_t test6 = {
+            .name = "A.2 Test Vector #3 - Keystream (counter=2)",
+            .key = {0},
+            .nonce = {0},
+            .counter = 2,
+            .plaintext = plaintext6,
+            .expected = expected6,
+            .length = 64
+        };
+        memcpy(test6.key, key6, 32);
+        memcpy(test6.nonce, nonce6, 12);
+
+        total_tests++;
+        if (run_test(&test6)) passed_tests++;
     }
 
     /* Print summary */
